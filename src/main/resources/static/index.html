@@ -1,0 +1,49 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <title>Checkout Service Test</title>
+    <script src="https://checkout.razorpay.com/v1/checkout.js"></script>
+</head>
+<body>
+    <h1>Real-Time Payment Test</h1>
+    <button id="pay-button">Pay ₹500</button>
+
+    <script>
+        document.getElementById('pay-button').onclick = async function (e) {
+            // 2. Call your Spring Boot API to create an Order
+            const response = await fetch(' https://hypothalamic-drenchingly-josie.ngrok-free.dev/api/payment/create-order', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ amount: 500 }) // Amount in INR
+            });
+
+            const orderId = await response.text(); 
+            // Note: If your API returns a JSON object, use await response.json()
+
+            // 3. Configure Razorpay Popup
+            const options = {
+                "key": "rzp_test_SElR6dCtE9ARWL", // Replace with your rzp_test_...
+                "amount": "50000", // Amount in paise (500 * 100)
+                "currency": "INR",
+                "name": "My Cool Store",
+                "description": "Test Transaction",
+                "order_id": orderId, // The ID returned by your Java Service
+                "handler": function (response) {
+                    // This runs AFTER payment is successful in the popup
+                    alert("Payment Successful! ID: " + response.razorpay_payment_id);
+                    console.log("Check your server logs for the Webhook now!");
+                },
+                "prefill": {
+                    "name": "John Doe",
+                    "email": "john.doe@example.com"
+                },
+                "theme": { "color": "#3399cc" }
+            };
+
+            const rzp = new Razorpay(options);
+            rzp.open();
+        };
+    </script>
+</body>
+</html>

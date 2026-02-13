@@ -1,0 +1,249 @@
+package com.checkout_service.service;
+
+import java.math.BigDecimal;
+import java.time.Instant;
+import java.util.List;
+import java.util.Map;
+import java.util.stream.Collectors;
+
+import org.springframework.stereotype.Service;
+
+import com.checkout_service.domain.CheckoutAddress;
+import com.checkout_service.domain.CheckoutItem;
+import com.checkout_service.domain.CheckoutOrder;
+import com.checkout_service.domain.CheckoutStatus;
+import com.checkout_service.domain.PaymentMethod;
+import com.checkout_service.dto.BulkReserveRequest;
+import com.checkout_service.dto.CreateCheckoutRequest;
+import com.checkout_service.dto.ProductResponse;
+import com.checkout_service.id.SnowflakeIdGenerator;
+import com.checkout_service.repo.CheckoutAddressRepository;
+import com.checkout_service.repo.CheckoutItemRepository;
+import com.checkout_service.repo.CheckoutOrderRepository;
+
+import jakarta.transaction.Transactional;
+
+@Service
+public class CheckoutService {
+
+    private final CheckoutOrderRepository orderRepo;
+    private final CheckoutItemRepository itemRepo;
+    private final CheckoutAddressRepository addressRepo;
+    private final ProductClient productClient;
+    private final SnowflakeIdGenerator idGenerator;
+
+    public CheckoutService(
+            CheckoutOrderRepository orderRepo,
+            CheckoutItemRepository itemRepo,
+            CheckoutAddressRepository addressRepo,
+            ProductClient productClient,
+            SnowflakeIdGenerator idGenerator) {
+
+        this.orderRepo = orderRepo;
+        this.itemRepo = itemRepo;
+        this.addressRepo = addressRepo;
+        this.productClient = productClient;
+        this.idGenerator = idGenerator;
+    }
+
+    // =====================================
+    // ENTRY POINT
+    // =====================================
+    public Long createAndInitiate(CreateCheckoutRequest request) {
+
+        if (request.items() == null || request.items().isEmpty()) {
+            throw new IllegalArgumentException("No items");
+        }
+
+        // 🔥 1. Fetch product prices BEFORE DB transaction
+        List<Long> productIds = request.items()
+                .stream()
+                .map(CreateCheckoutRequest.Item::productId)
+                .toList();
+
+        List<ProductResponse> products =
+                productClient.getProductsBulk(productIds);
+
+        Map<Long, BigDecimal> priceMap =
+                products.stream()
+                        .collect(Collectors.toMap(
+                                ProductResponse::id,
+                                ProductResponse::price
+                        ));
+
+        // 🔥 2. Create checkout inside DB transaction only
+        Long id = createCheckout(request, priceMap);
+
+        // 🔥 3. Initiate reservation outside transaction
+        try {
+            initiateOrder(id);
+        } catch (Exception e) {
+            // status already updated inside initiateOrder
+        }
+
+        return id;
+    }
+
+    // =====================================
+    // DB ONLY TRANSACTION
+    // =====================================
+@Transactional
+public Long createCheckout(
+        CreateCheckoutRequest request,
+        Map<Long, BigDecimal> priceMap) {
+
+    long checkoutId = idGenerator.nextId();
+    Instant now = Instant.now();
+
+    BigDecimal total = BigDecimal.ZERO;
+
+    // 🔥 1. Calculate total FIRST
+    for (var i : request.items()) {
+
+        BigDecimal price = priceMap.get(i.productId());
+
+        if (price == null) {
+            throw new RuntimeException(
+                    "Product not found: " + i.productId());
+        }
+
+        BigDecimal itemTotal =
+                price.multiply(BigDecimal.valueOf(i.quantity()));
+
+        total = total.add(itemTotal);
+    }
+
+    // 🔥 2. Create order with total already set
+    CheckoutOrder order = new CheckoutOrder();
+    order.setId(checkoutId);
+    order.setUserId(request.userId());
+    order.setStatus(CheckoutStatus.CREATED);
+    order.setPaymentMethod(request.paymentMethod());
+    order.setTotalAmount(total);     // ✅ SET BEFORE SAVE
+    order.setCreatedAt(now);
+    order.setUpdatedAt(now);
+
+    orderRepo.save(order);
+
+    // 🔥 3. Save items
+    for (var i : request.items()) {
+
+        BigDecimal price = priceMap.get(i.productId());
+
+        CheckoutItem item = new CheckoutItem();
+        item.setId(idGenerator.nextId());
+        item.setCheckoutId(checkoutId);
+        item.setProductId(i.productId());
+        item.setQuantity(i.quantity());
+        item.setPrice(price);
+
+        itemRepo.save(item);
+    }
+
+    // 🔥 4. Save address
+    var addr = request.address();
+
+    CheckoutAddress address = new CheckoutAddress();
+    address.setId(idGenerator.nextId());
+    address.setCheckoutId(checkoutId);
+    address.setFullName(addr.fullName());
+    address.setPhone(addr.phone());
+    address.setAddressLine1(addr.addressLine1());
+    address.setCity(addr.city());
+    address.setState(addr.state());
+    address.setPincode(addr.pincode());
+
+    addressRepo.save(address);
+
+    return checkoutId;
+}
+    // =====================================
+    // RESERVATION FLOW (NO DB TX)
+    // =====================================
+    public void initiateOrder(Long checkoutId) {
+
+        CheckoutOrder order =
+                orderRepo.findById(checkoutId).orElseThrow();
+
+        if (order.getStatus() != CheckoutStatus.CREATED)
+            return;
+
+        List<CheckoutItem> items =
+                itemRepo.findByCheckoutId(checkoutId);
+
+        try {
+
+            List<BulkReserveRequest.Item> reserveItems =
+                    items.stream()
+                            .map(i -> new BulkReserveRequest.Item(
+                                    i.getProductId(),
+                                    i.getQuantity()))
+                            .toList();
+
+            productClient.reserveBulk(checkoutId, reserveItems);
+
+            if (order.getPaymentMethod() == PaymentMethod.COD) {
+
+                productClient.confirm(checkoutId);
+                order.setStatus(CheckoutStatus.PAYMENT_SUCCESS);
+
+            } else {
+
+                order.setStatus(CheckoutStatus.PAYMENT_PENDING);
+            }
+
+        } catch (Exception e) {
+
+            order.setStatus(CheckoutStatus.CANCELLED);
+            productClient.release(checkoutId);
+            throw e;
+        }
+
+        order.setUpdatedAt(Instant.now());
+        orderRepo.save(order);
+    }
+
+    // =====================================
+    // PAYMENT CALLBACKS
+    // =====================================
+    @Transactional
+    public void handlePaymentSuccess(Long checkoutId) {
+
+        CheckoutOrder order =
+                orderRepo.findById(checkoutId).orElseThrow();
+
+        if (order.getStatus() == CheckoutStatus.PAYMENT_SUCCESS)
+            return;
+        // 🔥 Only allow from PAYMENT_PENDING
+        if (order.getStatus() != CheckoutStatus.PAYMENT_PENDING) {
+        throw new IllegalStateException(
+                "Invalid state transition to PAYMENT_SUCCESS from "
+                        + order.getStatus());
+        }
+
+        productClient.confirm(checkoutId);
+
+        order.setStatus(CheckoutStatus.PAYMENT_SUCCESS);
+        order.setUpdatedAt(Instant.now());
+    }
+
+    @Transactional
+    public void handlePaymentFailed(Long checkoutId) {
+
+        CheckoutOrder order =
+                orderRepo.findById(checkoutId).orElseThrow();
+
+        if (order.getStatus() == CheckoutStatus.PAYMENT_FAILED)
+            return;
+        // 🔥 Only allow from PAYMENT_PENDING
+        if (order.getStatus() != CheckoutStatus.PAYMENT_PENDING) {
+            throw new IllegalStateException(
+                "Invalid state transition to PAYMENT_FAILED from "
+                        + order.getStatus());
+        }
+        productClient.release(checkoutId);
+
+        order.setStatus(CheckoutStatus.PAYMENT_FAILED);
+        order.setUpdatedAt(Instant.now());
+    }
+}
