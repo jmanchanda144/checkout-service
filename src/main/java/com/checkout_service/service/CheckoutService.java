@@ -6,12 +6,14 @@ import java.util.List;
 import java.util.Map;
 import java.util.stream.Collectors;
 
+import org.springframework.kafka.core.KafkaTemplate;
 import org.springframework.stereotype.Service;
 
 import com.checkout_service.domain.CheckoutAddress;
 import com.checkout_service.domain.CheckoutItem;
 import com.checkout_service.domain.CheckoutOrder;
 import com.checkout_service.domain.CheckoutStatus;
+import com.checkout_service.domain.OrderCreatedEvent;
 import com.checkout_service.domain.PaymentMethod;
 import com.checkout_service.dto.BulkReserveRequest;
 import com.checkout_service.dto.CreateCheckoutRequest;
@@ -20,8 +22,10 @@ import com.checkout_service.id.SnowflakeIdGenerator;
 import com.checkout_service.repo.CheckoutAddressRepository;
 import com.checkout_service.repo.CheckoutItemRepository;
 import com.checkout_service.repo.CheckoutOrderRepository;
+import com.razorpay.RazorpayException;
 
 import jakarta.transaction.Transactional;
+import tools.jackson.databind.ObjectMapper;
 
 @Service
 public class CheckoutService {
@@ -31,25 +35,36 @@ public class CheckoutService {
     private final CheckoutAddressRepository addressRepo;
     private final ProductClient productClient;
     private final SnowflakeIdGenerator idGenerator;
+    private final PaymentService paymentService;
+    private final KafkaTemplate<String, String> kafkaTemplate;
+    private final ObjectMapper objectMapper;
+
 
     public CheckoutService(
             CheckoutOrderRepository orderRepo,
             CheckoutItemRepository itemRepo,
             CheckoutAddressRepository addressRepo,
             ProductClient productClient,
-            SnowflakeIdGenerator idGenerator) {
+            SnowflakeIdGenerator idGenerator,
+            PaymentService paymentService,
+            KafkaTemplate<String, String> kafkaTemplate,
+            ObjectMapper objectMapper) {
 
         this.orderRepo = orderRepo;
         this.itemRepo = itemRepo;
         this.addressRepo = addressRepo;
         this.productClient = productClient;
         this.idGenerator = idGenerator;
+        this.paymentService = paymentService;
+        this.kafkaTemplate = kafkaTemplate;
+        this.objectMapper = objectMapper;
     }
 
     // =====================================
     // ENTRY POINT
     // =====================================
-    public Long createAndInitiate(CreateCheckoutRequest request) {
+    @Transactional
+    public String createAndInitiate(CreateCheckoutRequest request) throws RazorpayException {
 
         if (request.items() == null || request.items().isEmpty()) {
             throw new IllegalArgumentException("No items");
@@ -60,7 +75,6 @@ public class CheckoutService {
                 .stream()
                 .map(CreateCheckoutRequest.Item::productId)
                 .toList();
-
         List<ProductResponse> products =
                 productClient.getProductsBulk(productIds);
 
@@ -81,7 +95,31 @@ public class CheckoutService {
             // status already updated inside initiateOrder
         }
 
-        return id;
+        CheckoutOrder order = orderRepo.findById(id).orElseThrow();
+
+    if (order.getPaymentMethod() == PaymentMethod.RAZORPAY) {
+
+        long amountInPaise =
+                order.getTotalAmount()
+                    .multiply(BigDecimal.valueOf(100))
+                    .longValueExact();
+
+        String razorpayOrderId;
+                razorpayOrderId = paymentService.createTransaction(
+                        amountInPaise,
+                        id.toString()
+                );
+
+        order.setRazorpayOrderId(razorpayOrderId);
+        order.setUpdatedAt(Instant.now());
+
+        orderRepo.save(order);
+
+        return razorpayOrderId;
+    }
+
+    return id.toString();
+
     }
 
     // =====================================
@@ -124,6 +162,17 @@ public Long createCheckout(
     order.setUpdatedAt(now);
 
     orderRepo.save(order);
+    
+    OrderCreatedEvent event =
+            new OrderCreatedEvent(order.getId(), order.getUserId());
+
+    String payload = objectMapper.writeValueAsString(event);
+
+    kafkaTemplate.send(
+        "order-events",
+        order.getId().toString(),   // KEY (important)
+        payload
+        );
 
     // 🔥 3. Save items
     for (var i : request.items()) {
@@ -160,6 +209,7 @@ public Long createCheckout(
     // =====================================
     // RESERVATION FLOW (NO DB TX)
     // =====================================
+    @Transactional
     public void initiateOrder(Long checkoutId) {
 
         CheckoutOrder order =
@@ -215,16 +265,11 @@ public Long createCheckout(
         if (order.getStatus() == CheckoutStatus.PAYMENT_SUCCESS)
             return;
         // 🔥 Only allow from PAYMENT_PENDING
-        if (order.getStatus() != CheckoutStatus.PAYMENT_PENDING) {
-        throw new IllegalStateException(
-                "Invalid state transition to PAYMENT_SUCCESS from "
-                        + order.getStatus());
-        }
-
+        if (order.getStatus() == CheckoutStatus.PAYMENT_PENDING) {
         productClient.confirm(checkoutId);
-
         order.setStatus(CheckoutStatus.PAYMENT_SUCCESS);
         order.setUpdatedAt(Instant.now());
+        }
     }
 
     @Transactional
@@ -236,14 +281,10 @@ public Long createCheckout(
         if (order.getStatus() == CheckoutStatus.PAYMENT_FAILED)
             return;
         // 🔥 Only allow from PAYMENT_PENDING
-        if (order.getStatus() != CheckoutStatus.PAYMENT_PENDING) {
-            throw new IllegalStateException(
-                "Invalid state transition to PAYMENT_FAILED from "
-                        + order.getStatus());
+        if (order.getStatus() == CheckoutStatus.PAYMENT_PENDING) {
+            productClient.release(checkoutId);
+            order.setStatus(CheckoutStatus.PAYMENT_FAILED);
+            order.setUpdatedAt(Instant.now());
         }
-        productClient.release(checkoutId);
-
-        order.setStatus(CheckoutStatus.PAYMENT_FAILED);
-        order.setUpdatedAt(Instant.now());
     }
 }

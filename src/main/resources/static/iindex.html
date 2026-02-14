@@ -1,0 +1,92 @@
+<script src="https://checkout.razorpay.com/v1/checkout.js"></script>
+
+<script>
+
+const CHECKOUT_API = "https://hypothalamic-drenchingly-josie.ngrok-free.dev/checkout";
+
+
+function loadSummary(){
+    let cart = JSON.parse(localStorage.getItem("cart")) || [];
+    let total = 0;
+    let container = document.getElementById("summaryItems");
+    container.innerHTML = "";
+
+    cart.forEach(item=>{
+        total += item.price * item.qty;
+        container.innerHTML += `
+        <div>${item.name} x ${item.qty}</div>`;
+    });
+
+    document.getElementById("total").innerText = "Total: ₹" + total;
+}
+
+async function placeOrder(){
+
+    let cart = JSON.parse(localStorage.getItem("cart")) || [];
+
+    if(cart.length === 0){
+        alert("Cart is empty");
+        return;
+    }
+
+    const fullName = document.querySelectorAll("input")[0].value;
+    const addressLine1 = document.querySelectorAll("input")[1].value;
+    const city = document.querySelectorAll("input")[2].value;
+    const phone = document.querySelectorAll("input")[3].value;
+
+    const requestBody = {
+        userId: 1,
+        paymentMethod: "RAZORPAY",
+        items: cart.map(item => ({
+            productId: item.productId,
+            quantity: item.qty
+        })),
+        address: {
+            fullName,
+            phone,
+            addressLine1,
+            city,
+            state: "Delhi",
+            pincode: "110001"
+        }
+    };
+
+    const response = await fetch(CHECKOUT_API, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(requestBody)
+    });
+
+    if(!response.ok){
+        const error = await response.text();
+        alert("Error: " + error);
+        return;
+    }
+
+    const razorpayOrderId = await response.text();
+
+    openRazorpay(razorpayOrderId);
+}
+
+function openRazorpay(orderId){
+
+    const options = {
+        key: "rzp_test_SElR6dCtE9ARWL",
+        order_id: orderId,
+        name: "My Store",
+        description: "Order Payment",
+        handler: function () {
+            alert("Payment Successful!");
+            localStorage.removeItem("cart");
+            window.location.href = "index.html";
+        },
+        theme: { color: "#3399cc" }
+    };
+
+    const rzp = new Razorpay(options);
+    rzp.open();
+}
+
+loadSummary();
+
+</script>
