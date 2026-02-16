@@ -10,7 +10,7 @@ spring:
   jpa:
     hibernate:
       ddl-auto: validate
-    show-sql: true
+    show-sql: false
     properties:
       hibernate:
         format_sql: false #true
@@ -19,6 +19,12 @@ spring:
 
   kafka:
     bootstrap-servers: localhost:9092
+    consumer:
+      group-id: checkout-group
+      auto-offset-reset: earliest
+      enable-auto-commit: false
+    listener:
+      ack-mode: manual
     producer:
       acks: all
       retries: 3
@@ -33,10 +39,10 @@ machine:
 
 razorpay:
   key:
-    id: 
-    secret: 
+    id: rzp_test_SElR6dCtE9ARWL
+    secret: Cm49XI1PUqUYvJevt2QWxq17
   webhook:
-    secret: 
+    secret: Cm49XI1PUqUYvJevt2QWxq17
 
 logging:
   level:

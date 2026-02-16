@@ -1,6 +1,5 @@
 package com.checkout_service.controller;
 
-import org.json.JSONException;
 import org.json.JSONObject;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.http.ResponseEntity;
@@ -11,13 +10,9 @@ import org.springframework.web.bind.annotation.RequestHeader;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
 
-import com.checkout_service.domain.CheckoutOrder;
 import com.checkout_service.repo.CheckoutOrderRepository;
 import com.checkout_service.service.CheckoutService;
-import com.razorpay.RazorpayException;
 import com.razorpay.Utils;
-
-import jakarta.transaction.Transactional;
 @CrossOrigin(origins = "*")
 @RestController
 @RequestMapping("/api/payment")
@@ -66,17 +61,7 @@ public class WebhookController {
                 String paymentId = paymentEntity.getString("id");
 
                 Long checkoutId = Long.valueOf(receipt);
-
-                CheckoutOrder order =
-                        orderRepo.findById(checkoutId).orElseThrow();
-
-                if (order.getStatus().name().equals("PAYMENT_SUCCESS")) {
-                    return ResponseEntity.ok("Already processed");
-                }
-
-                order.setRazorpayPaymentId(paymentId);
-
-                checkoutService.handlePaymentSuccess(checkoutId);
+                checkoutService.handlePaymentSuccess(checkoutId, paymentId);
             }
 
             return ResponseEntity.ok("Handled");
